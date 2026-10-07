@@ -4,18 +4,27 @@ import pg from 'pg';
 import 'dotenv/config';
 
 const app = express();
+const { Pool } = pg;
 
-const pool = new pg.Pool({
+const pool = new Pool({
     connectionString: process.env.DATABASE_URL
 });
+
+const PORT = process.env.PORT || 3000;
+const DEFAULT_LIMIT = 10;
 
 app.use(cors());
 app.use(express.json());
 
-function verifyAdmin(req, res, next) {
-    const userRole = req.headers['x-user-role'];
 
-    if (userRole !== 'admin') {
+// -------------------------
+// Admin middleware
+// -------------------------
+
+function requireAdmin(req, res, next) {
+    const role = req.headers['x-user-role'];
+
+    if (role !== 'admin') {
         return res.status(403).json({
             error: 'Access denied.'
         });
@@ -23,11 +32,18 @@ function verifyAdmin(req, res, next) {
 
     next();
 }
+
+
+// -------------------------
+// Get products
+// -------------------------
+
 app.get('/api/products', async (req, res) => {
     try {
         const search = req.query.search || '';
+
         const page = Number(req.query.page) || 1;
-        const limit = Number(req.query.limit) || 10;
+        const limit = Number(req.query.limit) || DEFAULT_LIMIT;
 
         if (page < 1) {
             return res.status(400).json({
@@ -43,6 +59,10 @@ app.get('/api/products', async (req, res) => {
 
         const offset = (page - 1) * limit;
 
+        /*
+         * These are the only columns the client is allowed
+         * to use when sorting the products.
+         */
         const allowedSortColumns = [
             'id',
             'name',
@@ -57,212 +77,276 @@ app.get('/api/products', async (req, res) => {
             sortBy = 'id';
         }
 
-        let order = req.query.order || 'ASC';
+        let order = String(req.query.order || 'ASC').toUpperCase();
 
-        if (order.toUpperCase() !== 'DESC') {
+        if (order !== 'DESC') {
             order = 'ASC';
-        } else {
-            order = 'DESC';
         }
 
         const searchValue = `%${search}%`;
 
-        const products = await pool.query(
-            `SELECT id, sku, name, current_stock, price
-             FROM products
-             WHERE name ILIKE $1 OR sku ILIKE $1
-             ORDER BY ${sortBy} ${order}
-             LIMIT $2 OFFSET $3`,
-            [searchValue, limit, offset]
-        );
+        const productsQuery = `
+            SELECT id, sku, name, current_stock, price
+            FROM products
+            WHERE name ILIKE $1
+               OR sku ILIKE $1
+            ORDER BY ${sortBy} ${order}
+            LIMIT $2
+            OFFSET $3
+        `;
 
-        const count = await pool.query(
-            `SELECT COUNT(*)
-             FROM products
-             WHERE name ILIKE $1 OR sku ILIKE $1`,
-            [searchValue]
-        );
+        const countQuery = `
+            SELECT COUNT(*)
+            FROM products
+            WHERE name ILIKE $1
+               OR sku ILIKE $1
+        `;
 
-        const totalProducts = Number(count.rows[0].count);
+        const [productsResult, countResult] = await Promise.all([
+            pool.query(productsQuery, [
+                searchValue,
+                limit,
+                offset
+            ]),
+            pool.query(countQuery, [searchValue])
+        ]);
 
+        const totalProducts = Number(countResult.rows[0].count);
         const totalPages = Math.ceil(totalProducts / limit);
 
         res.json({
-            products: products.rows,
-            totalPages: totalPages
+            products: productsResult.rows,
+            totalPages
         });
 
     } catch (error) {
-        console.error(error);
+        console.error('Error fetching products:', error);
 
         res.status(500).json({
             error: 'Something went wrong.'
         });
     }
 });
-app.post('/api/orders', async (req, res) => {
-    try {
-        const items = req.body.items;
 
-        if (!Array.isArray(items) || items.length === 0) {
+
+// -------------------------
+// Create order
+// -------------------------
+
+app.post('/api/orders', async (req, res) => {
+    const { items } = req.body;
+
+    if (!Array.isArray(items) || items.length === 0) {
+        return res.status(400).json({
+            error: 'Order must contain at least one item.'
+        });
+    }
+
+    // Validate the order before touching the database.
+    for (const item of items) {
+        if (
+            !Number.isInteger(item.productId) ||
+            item.productId <= 0
+        ) {
             return res.status(400).json({
-                error: 'Order must contain at least one item.'
+                error: 'Invalid product ID.'
             });
         }
+
+        if (
+            !Number.isInteger(item.quantity) ||
+            item.quantity <= 0
+        ) {
+            return res.status(400).json({
+                error: 'Quantity must be greater than 0.'
+            });
+        }
+    }
+
+    const client = await pool.connect();
+
+    try {
+        // Everything inside this block should succeed together.
+        await client.query('BEGIN');
+
+        const orderResult = await client.query(`
+            INSERT INTO orders (total_price)
+            VALUES (0)
+            RETURNING id
+        `);
+
+        const orderId = orderResult.rows[0].id;
+
+        let totalPrice = 0;
 
         for (const item of items) {
-            if (
-                !Number.isInteger(item.productId) ||
-                item.productId <= 0
-            ) {
-                return res.status(400).json({
-                    error: 'Invalid product ID.'
-                });
-            }
-
-            if (
-                !Number.isInteger(item.quantity) ||
-                item.quantity <= 0
-            ) {
-                return res.status(400).json({
-                    error: 'Quantity must be greater than 0.'
-                });
-            }
-        }
-
-        const client = await pool.connect();
-
-        try {
-            await client.query('BEGIN');
-
-            const orderResult = await client.query(
-                `INSERT INTO orders (total_price)
-                 VALUES (0)
-                 RETURNING id`
+            /*
+             * Lock the product row while checking and updating
+             * the stock. This helps prevent two orders from
+             * using the same stock at the same time.
+             */
+            const productResult = await client.query(
+                `
+                    SELECT id, current_stock, price
+                    FROM products
+                    WHERE id = $1
+                    FOR UPDATE
+                `,
+                [item.productId]
             );
 
-            const orderId = orderResult.rows[0].id;
+            if (productResult.rows.length === 0) {
+                await client.query('ROLLBACK');
 
-            let totalPrice = 0;
-
-            for (const item of items) {
-
-                const productResult = await client.query(
-                    `SELECT id, current_stock, price
-                     FROM products
-                     WHERE id = $1
-                     FOR UPDATE`,
-                    [item.productId]
-                );
-
-                if (productResult.rows.length === 0) {
-                    await client.query('ROLLBACK');
-
-                    return res.status(404).json({
-                        error: 'Product not found.'
-                    });
-                }
-
-                const product = productResult.rows[0];
-
-                if (product.current_stock < item.quantity) {
-                    await client.query('ROLLBACK');
-
-                    return res.status(400).json({
-                        error: `Not enough stock for product ${item.productId}.`
-                    });
-                }
-
-                const itemTotal =
-                    Number(product.price) * item.quantity;
-
-                totalPrice += itemTotal;
-
-                await client.query(
-                    `UPDATE products
-                     SET current_stock = current_stock - $1
-                     WHERE id = $2`,
-                    [item.quantity, item.productId]
-                );
-
-                await client.query(
-                    `INSERT INTO order_items
-                     (order_id, product_id, quantity, price_at_purchase)
-                     VALUES ($1, $2, $3, $4)`,
-                    [
-                        orderId,
-                        item.productId,
-                        item.quantity,
-                        product.price
-                    ]
-                );
+                return res.status(404).json({
+                    error: 'Product not found.'
+                });
             }
 
+            const product = productResult.rows[0];
+
+            if (product.current_stock < item.quantity) {
+                await client.query('ROLLBACK');
+
+                return res.status(400).json({
+                    error: `Not enough stock for product ${item.productId}.`
+                });
+            }
+
+            const itemTotal =
+                Number(product.price) * item.quantity;
+
+            totalPrice += itemTotal;
+
+            // Reduce the product stock.
             await client.query(
-                `UPDATE orders
-                 SET total_price = $1
-                 WHERE id = $2`,
-                [totalPrice, orderId]
+                `
+                    UPDATE products
+                    SET current_stock = current_stock - $1
+                    WHERE id = $2
+                `,
+                [
+                    item.quantity,
+                    item.productId
+                ]
             );
 
-            const savedOrder = await client.query(
-                `SELECT id, total_price, status, created_at
-                 FROM orders
-                 WHERE id = $1`,
-                [orderId]
+            /*
+             * Save the price that was actually used for this order.
+             * This is useful if the product price changes later.
+             */
+            await client.query(
+                `
+                    INSERT INTO order_items
+                        (
+                            order_id,
+                            product_id,
+                            quantity,
+                            price_at_purchase
+                        )
+                    VALUES ($1, $2, $3, $4)
+                `,
+                [
+                    orderId,
+                    item.productId,
+                    item.quantity,
+                    product.price
+                ]
             );
-
-            await client.query('COMMIT');
-
-            res.status(201).json({
-                order: savedOrder.rows[0]
-            });
-
-        } catch (error) {
-            await client.query('ROLLBACK');
-
-            console.error(error);
-
-            res.status(500).json({
-                error: 'Could not create order.'
-            });
-
-        } finally {
-            client.release();
         }
+
+        // Save the final order total.
+        await client.query(
+            `
+                UPDATE orders
+                SET total_price = $1
+                WHERE id = $2
+            `,
+            [
+                totalPrice,
+                orderId
+            ]
+        );
+
+        const savedOrder = await client.query(
+            `
+                SELECT id, total_price, status, created_at
+                FROM orders
+                WHERE id = $1
+            `,
+            [orderId]
+        );
+
+        // Everything worked, so save the transaction.
+        await client.query('COMMIT');
+
+        res.status(201).json({
+            order: savedOrder.rows[0]
+        });
 
     } catch (error) {
-        console.error(error);
+        // If anything failed, undo the entire order.
+        await client.query('ROLLBACK');
+
+        console.error('Error creating order:', error);
 
         res.status(500).json({
-            error: 'Something went wrong.'
+            error: 'Could not create order.'
         });
+
+    } finally {
+        // Always return the database connection to the pool.
+        client.release();
     }
 });
-app.patch('/api/products/:id/restock',verifyAdmin,async (req, res) => {
 
+
+// -------------------------
+// Restock product
+// -------------------------
+
+app.patch(
+    '/api/products/:id/restock',
+    requireAdmin,
+    async (req, res) => {
         try {
             const productId = Number(req.params.id);
             const quantity = Number(req.body.quantity);
 
-            if (!Number.isInteger(productId) || productId <= 0) {
+            if (
+                !Number.isInteger(productId) ||
+                productId <= 0
+            ) {
                 return res.status(400).json({
                     error: 'Invalid product ID.'
                 });
             }
 
-            if (!Number.isInteger(quantity) || quantity <= 0) {
+            if (
+                !Number.isInteger(quantity) ||
+                quantity <= 0
+            ) {
                 return res.status(400).json({
                     error: 'Quantity must be greater than 0.'
                 });
             }
 
             const result = await pool.query(
-                `UPDATE products
-                 SET current_stock = current_stock + $1
-                 WHERE id = $2
-                 RETURNING id, sku, name, current_stock, price`,
-                [quantity, productId]
+                `
+                    UPDATE products
+                    SET current_stock = current_stock + $1
+                    WHERE id = $2
+                    RETURNING
+                        id,
+                        sku,
+                        name,
+                        current_stock,
+                        price
+                `,
+                [
+                    quantity,
+                    productId
+                ]
             );
 
             if (result.rows.length === 0) {
@@ -276,7 +360,7 @@ app.patch('/api/products/:id/restock',verifyAdmin,async (req, res) => {
             });
 
         } catch (error) {
-            console.error(error);
+            console.error('Error restocking product:', error);
 
             res.status(500).json({
                 error: 'Could not restock product.'
@@ -284,13 +368,23 @@ app.patch('/api/products/:id/restock',verifyAdmin,async (req, res) => {
         }
     }
 );
+
+
+// -------------------------
+// Unknown routes
+// -------------------------
+
 app.use((req, res) => {
     res.status(404).json({
         error: 'Route not found.'
     });
 });
-const port = process.env.PORT || 3000;
 
-app.listen(port, () => {
-    console.log(`Server is running on port ${port}`);
+
+// -------------------------
+// Start server
+// -------------------------
+
+app.listen(PORT, () => {
+    console.log(`Server is running on port ${PORT}`);
 });
