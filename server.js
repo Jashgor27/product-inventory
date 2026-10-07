@@ -16,11 +16,6 @@ const DEFAULT_LIMIT = 10;
 app.use(cors());
 app.use(express.json());
 
-
-// -------------------------
-// Admin middleware
-// -------------------------
-
 function requireAdmin(req, res, next) {
     const role = req.headers['x-user-role'];
 
@@ -32,12 +27,6 @@ function requireAdmin(req, res, next) {
 
     next();
 }
-
-
-// -------------------------
-// Get products
-// -------------------------
-
 app.get('/api/products', async (req, res) => {
     try {
         const search = req.query.search || '';
@@ -58,11 +47,6 @@ app.get('/api/products', async (req, res) => {
         }
 
         const offset = (page - 1) * limit;
-
-        /*
-         * These are the only columns the client is allowed
-         * to use when sorting the products.
-         */
         const allowedSortColumns = [
             'id',
             'name',
@@ -128,11 +112,6 @@ app.get('/api/products', async (req, res) => {
     }
 });
 
-
-// -------------------------
-// Create order
-// -------------------------
-
 app.post('/api/orders', async (req, res) => {
     const { items } = req.body;
 
@@ -141,8 +120,6 @@ app.post('/api/orders', async (req, res) => {
             error: 'Order must contain at least one item.'
         });
     }
-
-    // Validate the order before touching the database.
     for (const item of items) {
         if (
             !Number.isInteger(item.productId) ||
@@ -166,7 +143,6 @@ app.post('/api/orders', async (req, res) => {
     const client = await pool.connect();
 
     try {
-        // Everything inside this block should succeed together.
         await client.query('BEGIN');
 
         const orderResult = await client.query(`
@@ -180,11 +156,6 @@ app.post('/api/orders', async (req, res) => {
         let totalPrice = 0;
 
         for (const item of items) {
-            /*
-             * Lock the product row while checking and updating
-             * the stock. This helps prevent two orders from
-             * using the same stock at the same time.
-             */
             const productResult = await client.query(
                 `
                     SELECT id, current_stock, price
@@ -217,8 +188,6 @@ app.post('/api/orders', async (req, res) => {
                 Number(product.price) * item.quantity;
 
             totalPrice += itemTotal;
-
-            // Reduce the product stock.
             await client.query(
                 `
                     UPDATE products
@@ -230,11 +199,6 @@ app.post('/api/orders', async (req, res) => {
                     item.productId
                 ]
             );
-
-            /*
-             * Save the price that was actually used for this order.
-             * This is useful if the product price changes later.
-             */
             await client.query(
                 `
                     INSERT INTO order_items
@@ -254,8 +218,6 @@ app.post('/api/orders', async (req, res) => {
                 ]
             );
         }
-
-        // Save the final order total.
         await client.query(
             `
                 UPDATE orders
@@ -276,8 +238,6 @@ app.post('/api/orders', async (req, res) => {
             `,
             [orderId]
         );
-
-        // Everything worked, so save the transaction.
         await client.query('COMMIT');
 
         res.status(201).json({
@@ -285,7 +245,6 @@ app.post('/api/orders', async (req, res) => {
         });
 
     } catch (error) {
-        // If anything failed, undo the entire order.
         await client.query('ROLLBACK');
 
         console.error('Error creating order:', error);
@@ -295,16 +254,9 @@ app.post('/api/orders', async (req, res) => {
         });
 
     } finally {
-        // Always return the database connection to the pool.
         client.release();
     }
 });
-
-
-// -------------------------
-// Restock product
-// -------------------------
-
 app.patch(
     '/api/products/:id/restock',
     requireAdmin,
@@ -368,23 +320,11 @@ app.patch(
         }
     }
 );
-
-
-// -------------------------
-// Unknown routes
-// -------------------------
-
 app.use((req, res) => {
     res.status(404).json({
         error: 'Route not found.'
     });
 });
-
-
-// -------------------------
-// Start server
-// -------------------------
-
 app.listen(PORT, () => {
     console.log(`Server is running on port ${PORT}`);
 });

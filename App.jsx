@@ -22,7 +22,6 @@ function App() {
 
     const limit = 10;
 
-    // Load products whenever the search, sorting or page changes
     useEffect(() => {
         let cancelled = false;
 
@@ -62,7 +61,6 @@ function App() {
         };
     }, [search, sortBy, order, page]);
 
-    // Add one product to the cart
     const addToCart = (product) => {
         const cartItem = cart.find(
             (item) => item.productId === product.id
@@ -106,7 +104,6 @@ function App() {
         setMessage('');
     };
 
-    // Remove one item from the cart
     const removeFromCart = (productId) => {
         setCart((currentCart) => {
             return currentCart
@@ -124,7 +121,6 @@ function App() {
         });
     };
 
-    // Place the order
     const checkout = async () => {
         if (cart.length === 0 || isCheckingOut) {
             return;
@@ -147,7 +143,6 @@ function App() {
             setCart([]);
             setMessage('Order placed successfully.');
 
-            // Refresh the products so the latest stock is shown
             setPage((currentPage) => currentPage);
         } catch (error) {
             const errorMessage =
@@ -164,7 +159,6 @@ function App() {
         }
     };
 
-    // Restock a product. Only admins can use this.
     const restockProduct = async (productId) => {
         if (userRole !== 'admin') {
             setMessage('Access denied.');
@@ -196,7 +190,6 @@ function App() {
                 [productId]: ''
             }));
 
-            // Reload the current page
             setPage((currentPage) => currentPage);
         } catch (error) {
             setMessage(
