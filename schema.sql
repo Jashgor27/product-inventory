@@ -25,9 +25,9 @@ CREATE INDEX products_name_sku_idx
     ON products USING btree (name, sku);
 
 INSERT INTO products (sku, name, current_stock, price) VALUES
-    ('SKU-1001', 'Laptop Stand', 2, 29.99),
-    ('SKU-1002', 'Wireless Mouse', 4, 19.99),
-    ('SKU-1003', 'Mechanical Keyboard', 10, 59.99),
+    ('SKU-1001', 'Laptop Stand', 2, 20.00),
+    ('SKU-1002', 'Wireless Mouse', 4, 189.99),
+    ('SKU-1003', 'Mechanical Keyboard', 10, 60.99),
     ('SKU-1004', 'USB-C Hub', 7, 39.99),
     ('SKU-1005', 'Monitor Cable', 3, 12.50),
     ('SKU-1006', 'Office Chair', 15, 149.00);
